@@ -13,6 +13,7 @@ from core.config import get_settings
 from core.exceptions import DomainError
 from domains.auth.dependencies import get_clock
 from domains.auth.router import router as auth_router
+from domains.wallet.router import router as wallet_router
 from shared.db.session import dispose_engine, get_engine
 
 clock = SystemClock()
@@ -107,6 +108,7 @@ def create_app() -> FastAPI:
             )
 
     app.include_router(auth_router)
+    app.include_router(wallet_router)
 
     return app
 
