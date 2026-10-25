@@ -64,6 +64,10 @@ def test_magic_bytes_rejects_truncated_and_oversized() -> None:
         validate_image_bytes(TRUNCATED_BYTES)
     assert exc_small.value.error_code == "INVALID_MEDIA_BYTES"
 
+    with pytest.raises(DomainError) as exc_empty:
+        validate_image_bytes(b"")
+    assert exc_empty.value.error_code == "INVALID_MEDIA_BYTES"
+
     with pytest.raises(DomainError) as exc_large:
         validate_image_bytes(OVERSIZED_BYTES)
     assert exc_large.value.error_code == "MEDIA_SIZE_LIMIT_EXCEEDED"
@@ -105,9 +109,8 @@ async def test_s3_storage_adapter_protocol_and_guards() -> None:
 
 @pytest.mark.asyncio
 async def test_in_memory_payment_gateway_adapter() -> None:
-    gateway: PaymentGatewayPort = InMemoryPaymentGatewayAdapter(
-        webhook_secret="whsec_contract_test"
-    )
+    gateway = InMemoryPaymentGatewayAdapter(webhook_secret="whsec_contract_test")
+    assert isinstance(gateway, PaymentGatewayPort)
     user_id = uuid.uuid4()
 
     with pytest.raises(DomainError):
@@ -131,10 +134,32 @@ async def test_in_memory_payment_gateway_adapter() -> None:
         gateway.verify_webhook_event(payload=b'{"id":"evt_1","type":"test"}', signature="bad_sig")
     assert exc_bad_sig.value.error_code == "INVALID_WEBHOOK_SIGNATURE"
 
+    with pytest.raises(DomainError) as exc_fake_t:
+        gateway.verify_webhook_event(payload=b'{"id":"evt_1","type":"test"}', signature="t=fake")
+    assert exc_fake_t.value.error_code == "INVALID_WEBHOOK_SIGNATURE"
+
+    with pytest.raises(DomainError) as exc_wrong_v1:
+        gateway.verify_webhook_event(
+            payload=b'{"id":"evt_1","type":"test"}',
+            signature="t=123,v1=wrong_signature",
+        )
+    assert exc_wrong_v1.value.error_code == "INVALID_WEBHOOK_SIGNATURE"
+
     valid_payload = b'{"id":"evt_1","type":"checkout.session.completed"}'
     verified = gateway.verify_webhook_event(payload=valid_payload, signature="whsec_contract_test")
     assert verified["id"] == "evt_1"
     assert verified["type"] == "checkout.session.completed"
+
+    verified_header = gateway.verify_webhook_event(
+        payload=valid_payload,
+        signature="t=123456,v1=whsec_contract_test",
+    )
+    assert verified_header["id"] == "evt_1"
+
+    completed_event = gateway.simulate_checkout_completed(session.session_id)
+    assert completed_event["type"] == "checkout.session.completed"
+    assert completed_event["data"]["object"]["client_reference_id"] == str(user_id)
+    assert gateway.get_session(session.session_id)["status"] == "complete"
 
 
 @pytest.mark.asyncio
@@ -171,6 +196,8 @@ def test_taskiq_broker_conformance() -> None:
     assert isinstance(broker, AsyncBroker)
     custom_broker = create_broker()
     assert isinstance(custom_broker, AsyncBroker)
+    in_memory = create_broker(in_memory=True)
+    assert isinstance(in_memory, AsyncBroker)
 
 
 @pytest.mark.asyncio

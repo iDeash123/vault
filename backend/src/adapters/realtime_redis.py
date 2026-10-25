@@ -32,6 +32,9 @@ class RedisRealtimeBrokerAdapter(RealtimeBrokerPort):
                     if isinstance(payload, bytes):
                         decoded: dict[str, Any] = json.loads(payload.decode("utf-8"))
                         yield decoded
+                    elif isinstance(payload, str):
+                        decoded_str: dict[str, Any] = json.loads(payload)
+                        yield decoded_str
         finally:
             await pubsub.unsubscribe(channel)
             await pubsub.close()

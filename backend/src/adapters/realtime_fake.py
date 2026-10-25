@@ -14,7 +14,7 @@ class InMemoryRealtimeBrokerAdapter(RealtimeBrokerPort):
 
     async def publish(self, channel: str, message: dict[str, Any]) -> None:
         self.published_events.append((channel, dict(message)))
-        queues = self._subscribers.get(channel, [])
+        queues = list(self._subscribers.get(channel, []))
         for queue in queues:
             await queue.put(dict(message))
 

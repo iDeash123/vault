@@ -49,7 +49,11 @@ class InMemoryPaymentGatewayAdapter(PaymentGatewayPort):
         payload: bytes,
         signature: str,
     ) -> dict[str, Any]:
-        if not signature or (signature != self.webhook_secret and not signature.startswith("t=")):
+        is_valid_direct = signature == self.webhook_secret
+        is_valid_header = signature.startswith("t=") and (
+            f"v1={self.webhook_secret}" in signature or self.webhook_secret in signature
+        )
+        if not signature or not (is_valid_direct or is_valid_header):
             raise DomainError(
                 message="Invalid Stripe webhook signature",
                 error_code="INVALID_WEBHOOK_SIGNATURE",

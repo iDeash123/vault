@@ -57,6 +57,18 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(_: Request, _exc: Exception) -> JSONResponse:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error_code": "INTERNAL_SERVER_ERROR",
+                "message": "An unexpected server error occurred",
+                "details": {},
+                "server_time": clock.now().isoformat(),
+            },
+        )
+
     @app.get("/api/v1/health")
     async def healthcheck() -> JSONResponse:
         now_iso = clock.now().isoformat()

@@ -65,8 +65,11 @@ class S3StorageAdapter(StoragePort):
         try:
             self._s3_client.head_object(Bucket=self.bucket_name, Key=key)
             return True
-        except ClientError:
-            return False
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in {"404", "NoSuchKey"}:
+                return False
+            raise
 
     async def upload(self, key: str, data: bytes, content_type: str | None = None) -> str:
         detected_mime = validate_image_bytes(data)
