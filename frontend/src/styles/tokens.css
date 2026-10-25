@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --ub-obsidian: #141414;
+    --ub-concrete: #A6A6A6;
+    --ub-slate: #525252;
+    --ub-mist: #D8D8D8;
+    --ub-carbon: #262626;
+    --ub-alabaster: #F5F5F5;
+    --font-display: 'Archivo', sans-serif;
+    --font-sans: 'Plus Jakarta Sans', sans-serif;
+    --font-mono: 'IBM Plex Mono', monospace;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    scroll-behavior: smooth;
+    background-color: var(--ub-obsidian);
+    color: var(--ub-alabaster);
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono-tech {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@keyframes marquee-vertical {
+  0% {
+    transform: translateY(0%);
+  }
+  100% {
+    transform: translateY(-50%);
+  }
+}
+
+.animate-marquee-vertical {
+  animation: marquee-vertical 14s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-marquee-vertical {
+    animation: none;
+  }
+}
