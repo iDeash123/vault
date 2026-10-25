@@ -10,6 +10,7 @@ from sqlalchemy import text
 from core.clock import SystemClock
 from core.config import get_settings
 from core.exceptions import DomainError
+from domains.auth.router import router as auth_router
 from shared.db.session import dispose_engine, get_engine
 
 clock = SystemClock()
@@ -95,6 +96,8 @@ def create_app() -> FastAPI:
                     "version": "1.0.0",
                 },
             )
+
+    app.include_router(auth_router)
 
     return app
 

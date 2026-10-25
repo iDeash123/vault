@@ -7,6 +7,11 @@ class UserRole(StrEnum):
     ADMIN = "ADMIN"
 
 
+class OAuthProvider(StrEnum):
+    GOOGLE = "GOOGLE"
+    GITHUB = "GITHUB"
+
+
 class WalletHoldStatus(StrEnum):
     ACTIVE_HOLD = "ACTIVE_HOLD"
     CLAIMABLE = "CLAIMABLE"
