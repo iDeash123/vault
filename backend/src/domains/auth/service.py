@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.clock import ClockPort
@@ -62,6 +63,24 @@ def parse_oauth_provider(provider_raw: str) -> OAuthProvider:
             error_code="UNSUPPORTED_OAUTH_PROVIDER",
             status_code=400,
         ) from exc
+
+
+def _parse_json_dict(response: httpx.Response, error_code: str, message: str) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise DomainError(
+            message=message,
+            error_code=error_code,
+            status_code=400,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise DomainError(
+            message=message,
+            error_code=error_code,
+            status_code=400,
+        )
+    return payload
 
 
 class AuthService:
@@ -152,20 +171,28 @@ class AuthService:
             )
 
         password_digest = hash_password(payload.password)
-        user, wallet = await self._repo.create_user_with_wallet(
-            email=payload.email,
-            username=payload.username,
-            password_hash=password_digest,
-            role=UserRole.MEMBER,
-            bio=payload.bio,
-        )
-        token_response, raw_refresh = await self._issue_session_tokens(
-            user=user,
-            wallet=wallet,
-            user_agent=user_agent,
-            ip_address=ip_address,
-        )
-        await self._session.commit()
+        try:
+            user, wallet = await self._repo.create_user_with_wallet(
+                email=payload.email,
+                username=payload.username,
+                password_hash=password_digest,
+                role=UserRole.MEMBER,
+                bio=payload.bio,
+            )
+            token_response, raw_refresh = await self._issue_session_tokens(
+                user=user,
+                wallet=wallet,
+                user_agent=user_agent,
+                ip_address=ip_address,
+            )
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise ConflictError(
+                message="Email or username is already registered",
+                error_code="USER_ALREADY_EXISTS",
+                details={"email": payload.email, "username": payload.username},
+            ) from exc
         return token_response, raw_refresh
 
     async def login(
@@ -273,16 +300,22 @@ class AuthService:
         user_id: uuid.UUID | None = None,
     ) -> LogoutResponse:
         now = self._clock.now()
+        revoked_specific = False
         if raw_refresh_token:
             token_hash = hash_refresh_token(raw_refresh_token)
             session_record = await self._repo.get_refresh_session_by_hash(
                 token_hash=token_hash,
                 for_update=True,
             )
-            if session_record is not None and session_record.revoked_at is None:
-                await self._repo.revoke_refresh_session(session_record, revoked_at=now)
-                await self._session.commit()
-        elif user_id is not None:
+            if session_record is not None and (
+                user_id is None or session_record.user_id == user_id
+            ):
+                revoked_specific = True
+                if session_record.revoked_at is None:
+                    await self._repo.revoke_refresh_session(session_record, revoked_at=now)
+                    await self._session.commit()
+
+        if not revoked_specific and user_id is not None:
             await self._repo.revoke_all_user_refresh_sessions(user_id=user_id, revoked_at=now)
             await self._session.commit()
 
@@ -348,24 +381,36 @@ class AuthService:
         code: str,
         redirect_uri: str,
     ) -> OAuthUserInfo:
-        token_resp = await client.post(
-            GOOGLE_EXCHANGE_URL,
-            data={
-                "code": code,
-                "client_id": self._oauth_settings.GOOGLE_CLIENT_ID,
-                "client_secret": self._oauth_settings.GOOGLE_CLIENT_SECRET.get_secret_value(),
-                "redirect_uri": redirect_uri,
-                "grant_type": "authorization_code",
-            },
-            headers={"Accept": "application/json"},
-        )
+        try:
+            token_resp = await client.post(
+                GOOGLE_EXCHANGE_URL,
+                data={
+                    "code": code,
+                    "client_id": self._oauth_settings.GOOGLE_CLIENT_ID,
+                    "client_secret": self._oauth_settings.GOOGLE_CLIENT_SECRET.get_secret_value(),
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            raise DomainError(
+                message="Failed to exchange Google OAuth authorization code",
+                error_code="OAUTH_TOKEN_EXCHANGE_FAILED",
+                status_code=400,
+            ) from exc
+
         if token_resp.status_code >= 400:
             raise DomainError(
                 message="Failed to exchange Google OAuth authorization code",
                 error_code="OAUTH_TOKEN_EXCHANGE_FAILED",
                 status_code=400,
             )
-        token_data: dict[str, Any] = token_resp.json()
+        token_data = _parse_json_dict(
+            token_resp,
+            error_code="OAUTH_TOKEN_EXCHANGE_FAILED",
+            message="Invalid Google OAuth token response",
+        )
         access_token = token_data.get("access_token")
         if not isinstance(access_token, str) or not access_token:
             raise DomainError(
@@ -374,22 +419,35 @@ class AuthService:
                 status_code=400,
             )
 
-        userinfo_resp = await client.get(
-            GOOGLE_USERINFO_URL,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
+        try:
+            userinfo_resp = await client.get(
+                GOOGLE_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        except httpx.HTTPError as exc:
+            raise DomainError(
+                message="Failed to fetch Google user profile",
+                error_code="OAUTH_PROFILE_FETCH_FAILED",
+                status_code=400,
+            ) from exc
+
         if userinfo_resp.status_code >= 400:
             raise DomainError(
                 message="Failed to fetch Google user profile",
                 error_code="OAUTH_PROFILE_FETCH_FAILED",
                 status_code=400,
             )
-        profile_data: dict[str, Any] = userinfo_resp.json()
+        profile_data = _parse_json_dict(
+            userinfo_resp,
+            error_code="OAUTH_PROFILE_FETCH_FAILED",
+            message="Invalid Google user profile response",
+        )
         sub = profile_data.get("sub") or profile_data.get("id")
         email = profile_data.get("email")
-        if not sub or not isinstance(email, str) or not email.strip():
+        email_verified = profile_data.get("email_verified")
+        if not sub or not isinstance(email, str) or not email.strip() or email_verified is False:
             raise DomainError(
-                message="Google OAuth profile is missing subject ID or email",
+                message="Google OAuth profile is missing a verified email or subject ID",
                 error_code="OAUTH_EMAIL_REQUIRED",
                 status_code=400,
             )
@@ -410,16 +468,23 @@ class AuthService:
         code: str,
         redirect_uri: str,
     ) -> OAuthUserInfo:
-        token_resp = await client.post(
-            GITHUB_EXCHANGE_URL,
-            data={
-                "code": code,
-                "client_id": self._oauth_settings.GITHUB_CLIENT_ID,
-                "client_secret": self._oauth_settings.GITHUB_CLIENT_SECRET.get_secret_value(),
-                "redirect_uri": redirect_uri,
-            },
-            headers={"Accept": "application/json"},
-        )
+        try:
+            token_resp = await client.post(
+                GITHUB_EXCHANGE_URL,
+                data={
+                    "code": code,
+                    "client_id": self._oauth_settings.GITHUB_CLIENT_ID,
+                    "client_secret": self._oauth_settings.GITHUB_CLIENT_SECRET.get_secret_value(),
+                    "redirect_uri": redirect_uri,
+                },
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as exc:
+            raise DomainError(
+                message="Failed to exchange GitHub OAuth authorization code",
+                error_code="OAUTH_TOKEN_EXCHANGE_FAILED",
+                status_code=400,
+            ) from exc
 
         if token_resp.status_code >= 400:
             raise DomainError(
@@ -427,7 +492,11 @@ class AuthService:
                 error_code="OAUTH_TOKEN_EXCHANGE_FAILED",
                 status_code=400,
             )
-        token_data: dict[str, Any] = token_resp.json()
+        token_data = _parse_json_dict(
+            token_resp,
+            error_code="OAUTH_TOKEN_EXCHANGE_FAILED",
+            message="Invalid GitHub OAuth token response",
+        )
         access_token = token_data.get("access_token")
         if not isinstance(access_token, str) or not access_token:
             raise DomainError(
@@ -440,14 +509,26 @@ class AuthService:
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
         }
-        user_resp = await client.get(GITHUB_USER_URL, headers=auth_headers)
+        try:
+            user_resp = await client.get(GITHUB_USER_URL, headers=auth_headers)
+        except httpx.HTTPError as exc:
+            raise DomainError(
+                message="Failed to fetch GitHub user profile",
+                error_code="OAUTH_PROFILE_FETCH_FAILED",
+                status_code=400,
+            ) from exc
+
         if user_resp.status_code >= 400:
             raise DomainError(
                 message="Failed to fetch GitHub user profile",
                 error_code="OAUTH_PROFILE_FETCH_FAILED",
                 status_code=400,
             )
-        user_data: dict[str, Any] = user_resp.json()
+        user_data = _parse_json_dict(
+            user_resp,
+            error_code="OAUTH_PROFILE_FETCH_FAILED",
+            message="Invalid GitHub user profile response",
+        )
         provider_id = user_data.get("id")
         if provider_id is None:
             raise DomainError(
@@ -456,22 +537,21 @@ class AuthService:
                 status_code=400,
             )
 
-        email_val = user_data.get("email")
-        resolved_email: str | None = (
-            email_val.strip().lower() if isinstance(email_val, str) and email_val.strip() else None
-        )
-
-        if resolved_email is None:
+        resolved_email: str | None = None
+        emails_fetched = False
+        try:
             emails_resp = await client.get(GITHUB_EMAILS_URL, headers=auth_headers)
             if emails_resp.status_code < 400:
                 emails_list = emails_resp.json()
                 if isinstance(emails_list, list):
+                    emails_fetched = True
                     for item in emails_list:
                         if (
                             isinstance(item, dict)
                             and item.get("primary") is True
                             and item.get("verified") is True
                             and isinstance(item.get("email"), str)
+                            and item["email"].strip()
                         ):
                             resolved_email = item["email"].strip().lower()
                             break
@@ -481,9 +561,17 @@ class AuthService:
                                 isinstance(item, dict)
                                 and item.get("verified") is True
                                 and isinstance(item.get("email"), str)
+                                and item["email"].strip()
                             ):
                                 resolved_email = item["email"].strip().lower()
                                 break
+        except (httpx.HTTPError, ValueError):
+            emails_fetched = False
+
+        if not emails_fetched and resolved_email is None:
+            email_val = user_data.get("email")
+            if isinstance(email_val, str) and email_val.strip():
+                resolved_email = email_val.strip().lower()
 
         if not resolved_email:
             raise DomainError(
@@ -520,10 +608,13 @@ class AuthService:
             return await self._fetch_github_userinfo(client, code, callback_uri)
 
     async def _generate_unique_username(self, raw_hint: str) -> str:
-        sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_hint).strip("_")
-        if len(sanitized) < 3:
+        collapsed = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_hint)
+        sanitized = re.sub(r"_+", "_", collapsed).strip("_")
+        if len(sanitized) < 3 or not re.search(r"[a-zA-Z0-9]", sanitized):
             sanitized = f"archivist_{secrets.token_hex(3)}"
-        base_candidate = sanitized[:48]
+        base_candidate = sanitized[:48].rstrip("_")
+        if len(base_candidate) < 3:
+            base_candidate = f"archivist_{secrets.token_hex(3)}"
         existing = await self._repo.get_user_by_username(base_candidate)
         if existing is None:
             return base_candidate
@@ -552,11 +643,21 @@ class AuthService:
                     message="Linked user account not found",
                     error_code="USER_NOT_FOUND",
                 )
+            if not user.is_active:
+                raise ForbiddenError(
+                    message="User account is inactive",
+                    error_code="USER_INACTIVE",
+                )
             wallet = await self._repo.get_or_create_wallet(user.id)
         else:
             existing_user = await self._repo.get_user_by_email(userinfo.email)
             if existing_user is not None:
                 user = existing_user
+                if not user.is_active:
+                    raise ForbiddenError(
+                        message="User account is inactive",
+                        error_code="USER_INACTIVE",
+                    )
                 if user.avatar_url is None and userinfo.avatar_url is not None:
                     user.avatar_url = userinfo.avatar_url
                 wallet = await self._repo.get_or_create_wallet(user.id)
@@ -581,12 +682,6 @@ class AuthService:
                     provider_user_id=userinfo.provider_user_id,
                     email=userinfo.email,
                 )
-
-        if not user.is_active:
-            raise ForbiddenError(
-                message="User account is inactive",
-                error_code="USER_INACTIVE",
-            )
 
         token_response, raw_refresh = await self._issue_session_tokens(
             user=user,

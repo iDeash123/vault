@@ -31,7 +31,7 @@ class OAuthSettings(BaseSettings):
     GOOGLE_CLIENT_SECRET: SecretStr
     GITHUB_CLIENT_ID: str
     GITHUB_CLIENT_SECRET: SecretStr
-    OAUTH_FRONTEND_REDIRECT_URL: str = "http://localhost:5173/auth/callback"
+    OAUTH_FRONTEND_REDIRECT_URL: str
 
 
 @lru_cache
@@ -104,7 +104,7 @@ def decode_access_token(
         ) from exc
 
     exp_val = payload.get("exp")
-    if not isinstance(exp_val, int | float) or exp_val <= current_ts:
+    if isinstance(exp_val, bool) or not isinstance(exp_val, int | float) or exp_val <= current_ts:
         raise UnauthorizedError(
             message="Access token has expired",
             error_code="ACCESS_TOKEN_EXPIRED",
@@ -164,7 +164,7 @@ def verify_oauth_state(
         ) from exc
 
     exp_val = payload.get("exp")
-    if not isinstance(exp_val, int | float) or exp_val <= current_ts:
+    if isinstance(exp_val, bool) or not isinstance(exp_val, int | float) or exp_val <= current_ts:
         raise DomainError(
             message="OAuth state parameter has expired",
             error_code="OAUTH_STATE_EXPIRED",

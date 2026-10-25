@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -7,7 +8,7 @@ import pytest
 from fastapi import Depends
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from core.clock import FrozenClock
 from domains.auth.dependencies import (
@@ -66,7 +67,7 @@ async def test_register_creates_user_and_zero_balance_wallet(
         "/api/v1/auth/register",
         json={
             "email": "Archivist@Obsolete.io",
-            "username": "raf_collector",
+            "username": "  raf_collector  ",
             "password": "StrongVaultPassword!23",
             "bio": "Archival collector since 2001",
         },
@@ -74,7 +75,7 @@ async def test_register_creates_user_and_zero_balance_wallet(
     assert response.status_code == 201
     data = response.json()
     assert "access_token" in data
-    assert "server_time" in data
+    assert data["server_time"] == "2026-10-25T12:00:00Z"
     assert "refresh_token" in response.cookies
 
     user_payload = data["user"]
@@ -122,6 +123,7 @@ async def test_register_duplicate_email_and_username_rejected(
     )
     assert dup_email.status_code == 409
     assert dup_email.json()["error_code"] == "EMAIL_ALREADY_REGISTERED"
+    assert dup_email.json()["server_time"] == "2026-10-25T12:00:00+00:00"
 
     dup_username = await api_client.post(
         "/api/v1/auth/register",
@@ -229,31 +231,95 @@ async def test_refresh_token_rotation_and_reuse_detection(
 
 
 @pytest.mark.asyncio
-async def test_logout_revokes_refresh_session(
+async def test_concurrent_refresh_token_rotation_locks_and_detects_reuse(
+    db_engine: AsyncEngine,
+    frozen_clock: FrozenClock,
+) -> None:
+    session_factory = async_sessionmaker(
+        bind=db_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    app = create_app()
+
+    async def override_db() -> AsyncGenerator[AsyncSession, None]:
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db_session] = override_db
+    app.dependency_overrides[get_clock] = lambda: frozen_clock
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://localhost") as setup_client:
+        reg_resp = await setup_client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "concurrent_refresh@obsolete.io",
+                "username": "concurrent_rotator",
+                "password": "StrongVaultPassword!23",
+            },
+        )
+        assert reg_resp.status_code == 201
+        shared_refresh_token = reg_resp.cookies["refresh_token"]
+
+    async def invoke_refresh() -> int:
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://localhost",
+            cookies={"refresh_token": shared_refresh_token},
+        ) as client:
+            resp = await client.post("/api/v1/auth/refresh")
+            return resp.status_code
+
+    statuses = await asyncio.gather(invoke_refresh(), invoke_refresh())
+    assert sorted(statuses) == [200, 401]
+
+    async with session_factory() as verify_session:
+        sessions = (await verify_session.execute(select(RefreshSession))).scalars().all()
+        assert len(sessions) == 2
+        assert all(s.revoked_at is not None for s in sessions)
+
+
+@pytest.mark.asyncio
+async def test_logout_revokes_refresh_session_and_isolates_other_users(
     api_client: AsyncClient,
 ) -> None:
-    reg_resp = await api_client.post(
+    reg_a = await api_client.post(
         "/api/v1/auth/register",
         json={
-            "email": "logout@obsolete.io",
-            "username": "logout_user",
+            "email": "user_a@obsolete.io",
+            "username": "logout_user_a",
             "password": "StrongVaultPassword!23",
         },
     )
-    access_token = reg_resp.json()["access_token"]
-    refresh_token = reg_resp.cookies["refresh_token"]
+    access_a = reg_a.json()["access_token"]
+    refresh_a = reg_a.cookies["refresh_token"]
 
-    api_client.cookies.set("refresh_token", refresh_token)
+    reg_b = await api_client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "user_b@obsolete.io",
+            "username": "logout_user_b",
+            "password": "StrongVaultPassword!23",
+        },
+    )
+    refresh_b = reg_b.cookies["refresh_token"]
+
+    api_client.cookies.set("refresh_token", refresh_b)
     logout_resp = await api_client.post(
         "/api/v1/auth/logout",
-        headers={"Authorization": f"Bearer {access_token}"},
+        headers={"Authorization": f"Bearer {access_a}"},
     )
     assert logout_resp.status_code == 200
     assert logout_resp.json()["status"] == "logged_out"
 
-    api_client.cookies.set("refresh_token", refresh_token)
-    refresh_after_logout = await api_client.post("/api/v1/auth/refresh")
-    assert refresh_after_logout.status_code == 401
+    api_client.cookies.set("refresh_token", refresh_a)
+    refresh_a_after = await api_client.post("/api/v1/auth/refresh")
+    assert refresh_a_after.status_code == 401
+
+    api_client.cookies.set("refresh_token", refresh_b)
+    refresh_b_after = await api_client.post("/api/v1/auth/refresh")
+    assert refresh_b_after.status_code == 200
 
 
 @pytest.mark.asyncio

@@ -20,10 +20,12 @@ class RegisterRequest(BaseModel):
     def normalize_email(cls, value: EmailStr) -> str:
         return str(value).strip().lower()
 
-    @field_validator("username", mode="after")
+    @field_validator("username", mode="before")
     @classmethod
-    def normalize_username(cls, value: str) -> str:
-        return value.strip()
+    def normalize_username(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip()
+        return value
 
 
 class LoginRequest(BaseModel):

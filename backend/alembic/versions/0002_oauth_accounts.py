@@ -55,6 +55,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index("ix_oauth_accounts_user_id", table_name="oauth_accounts")
     op.drop_table("oauth_accounts")
+    op.execute(sa.text("UPDATE users SET password_hash = '' WHERE password_hash IS NULL"))
     op.alter_column(
         "users",
         "password_hash",

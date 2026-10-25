@@ -20,20 +20,48 @@ from shared.db.session import get_db_session
 def _mock_oauth_handler(request: Request) -> Response:
     url_str = str(request.url)
     if url_str == "https://oauth2.googleapis.com/token":
+        body_text = request.content.decode("utf-8")
+        if "code=unverified_google_code" in body_text:
+            return Response(200, json={"access_token": "google_unverified_token"})
         return Response(200, json={"access_token": "google_mock_access_token"})
     if url_str == "https://openidconnect.googleapis.com/v1/userinfo":
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header == "Bearer google_unverified_token":
+            return Response(
+                200,
+                json={
+                    "sub": "google-attacker-111",
+                    "email": "victim@obsolete.io",
+                    "email_verified": False,
+                    "name": "Attacker",
+                },
+            )
         return Response(
             200,
             json={
                 "sub": "google-uid-998877",
                 "email": "Martin.Margiela@Obsolete.io",
+                "email_verified": True,
                 "name": "Martin Margiela",
                 "picture": "https://lh3.googleusercontent.com/a/margiela",
             },
         )
     if url_str == "https://github.com/login/oauth/access_token":
+        body_text = request.content.decode("utf-8")
+        if "code=unverified_gh_code" in body_text:
+            return Response(200, json={"access_token": "github_unverified_token"})
         return Response(200, json={"access_token": "github_mock_access_token"})
     if url_str == "https://api.github.com/user":
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header == "Bearer github_unverified_token":
+            return Response(
+                200,
+                json={
+                    "id": 999111,
+                    "login": "spoof_handle",
+                    "email": "victim@obsolete.io",
+                },
+            )
         return Response(
             200,
             json={
@@ -44,6 +72,14 @@ def _mock_oauth_handler(request: Request) -> Response:
             },
         )
     if url_str == "https://api.github.com/user/emails":
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header == "Bearer github_unverified_token":
+            return Response(
+                200,
+                json=[
+                    {"email": "victim@obsolete.io", "primary": True, "verified": False},
+                ],
+            )
         return Response(
             200,
             json=[
@@ -129,6 +165,14 @@ async def test_google_oauth_provisions_passwordless_user_and_wallet(
     oauth_acc = (await db_session.execute(stmt_oauth)).scalar_one()
     assert oauth_acc.user_id == user.id
 
+    second_cb_resp = await oauth_api_client.get(
+        "/api/v1/auth/oauth/google/callback",
+        params={"code": "google_auth_code_123", "state": state},
+    )
+    assert second_cb_resp.status_code == 302
+    all_oauth_rows = (await db_session.execute(select(OAuthAccount))).scalars().all()
+    assert len(all_oauth_rows) == 1
+
     me_resp = await oauth_api_client.get(
         "/api/v1/auth/me",
         headers={"Authorization": f"Bearer {access_token}"},
@@ -213,6 +257,43 @@ async def test_oauth_links_to_existing_account_with_same_email(
     oauth_accounts = (await db_session.execute(select(OAuthAccount))).scalars().all()
     assert len(oauth_accounts) == 1
     assert str(oauth_accounts[0].user_id) == original_user_id
+
+
+@pytest.mark.asyncio
+async def test_oauth_rejects_unverified_emails_and_prevents_account_linking(
+    oauth_api_client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    reg_resp = await oauth_api_client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "victim@obsolete.io",
+            "username": "victim_collector",
+            "password": "StrongVaultPassword!23",
+        },
+    )
+    assert reg_resp.status_code == 201
+
+    google_auth = await oauth_api_client.get("/api/v1/auth/oauth/google/authorize")
+    google_state = google_auth.json()["state"]
+    google_cb = await oauth_api_client.get(
+        "/api/v1/auth/oauth/google/callback",
+        params={"code": "unverified_google_code", "state": google_state},
+    )
+    assert google_cb.status_code == 400
+    assert google_cb.json()["error_code"] == "OAUTH_EMAIL_REQUIRED"
+
+    gh_auth = await oauth_api_client.get("/api/v1/auth/oauth/github/authorize")
+    gh_state = gh_auth.json()["state"]
+    gh_cb = await oauth_api_client.get(
+        "/api/v1/auth/oauth/github/callback",
+        params={"code": "unverified_gh_code", "state": gh_state},
+    )
+    assert gh_cb.status_code == 400
+    assert gh_cb.json()["error_code"] == "OAUTH_EMAIL_REQUIRED"
+
+    oauth_accounts = (await db_session.execute(select(OAuthAccount))).scalars().all()
+    assert len(oauth_accounts) == 0
 
 
 @pytest.mark.asyncio

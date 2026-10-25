@@ -2,14 +2,16 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from core.clock import SystemClock
+from core.clock import ClockPort, SystemClock
 from core.config import get_settings
 from core.exceptions import DomainError
+from domains.auth.dependencies import get_clock
 from domains.auth.router import router as auth_router
 from shared.db.session import dispose_engine, get_engine
 
@@ -31,6 +33,13 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    def resolve_clock() -> ClockPort:
+        override = app.dependency_overrides.get(get_clock)
+        if override is not None:
+            resolved: ClockPort = override()
+            return resolved
+        return clock
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -43,7 +52,7 @@ def create_app() -> FastAPI:
     async def domain_error_handler(_: Request, exc: DomainError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
-            content=exc.to_problem_details(server_time=clock.now()),
+            content=exc.to_problem_details(server_time=resolve_clock().now()),
         )
 
     @app.exception_handler(RequestValidationError)
@@ -53,8 +62,8 @@ def create_app() -> FastAPI:
             content={
                 "error_code": "VALIDATION_ERROR",
                 "message": "Request validation failed",
-                "details": {"errors": exc.errors()},
-                "server_time": clock.now().isoformat(),
+                "details": {"errors": jsonable_encoder(exc.errors())},
+                "server_time": resolve_clock().now().isoformat(),
             },
         )
 
@@ -66,13 +75,13 @@ def create_app() -> FastAPI:
                 "error_code": "INTERNAL_SERVER_ERROR",
                 "message": "An unexpected server error occurred",
                 "details": {},
-                "server_time": clock.now().isoformat(),
+                "server_time": resolve_clock().now().isoformat(),
             },
         )
 
     @app.get("/api/v1/health")
     async def healthcheck() -> JSONResponse:
-        now_iso = clock.now().isoformat()
+        now_iso = resolve_clock().now().isoformat()
         try:
             engine = get_engine()
             async with engine.connect() as conn:
