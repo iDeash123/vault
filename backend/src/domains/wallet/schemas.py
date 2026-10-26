@@ -71,3 +71,22 @@ class WalletSummaryResponse(BaseModel):
     holds: list[WalletHoldItemResponse]
     ledger_entries: list[LedgerEntryItemResponse]
     server_time: datetime
+
+
+class ClaimHoldResponse(BaseModel):
+    hold: WalletHoldItemResponse
+    claimed_amount: Decimal
+    available_balance: Decimal
+    held_balance: Decimal
+    claimable_balance: Decimal
+    server_time: datetime
+
+
+class ClaimAllHoldsResponse(BaseModel):
+    claimed_count: int
+    claimed_amount: Decimal
+    claimed_hold_ids: list[uuid.UUID]
+    available_balance: Decimal
+    held_balance: Decimal
+    claimable_balance: Decimal
+    server_time: datetime

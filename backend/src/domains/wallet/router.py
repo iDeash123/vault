@@ -1,3 +1,4 @@
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Request
@@ -7,6 +8,8 @@ from adapters.payment_stripe import StripePaymentGatewayAdapter
 from core.clock import ClockPort
 from domains.auth.dependencies import get_clock, get_current_user
 from domains.wallet.schemas import (
+    ClaimAllHoldsResponse,
+    ClaimHoldResponse,
     StripeWebhookResponse,
     TopupCheckoutRequest,
     TopupCheckoutResponse,
@@ -53,6 +56,26 @@ async def create_topup_checkout(
     return await service.create_topup_checkout(
         user_id=current_user.id,
         payload=payload,
+    )
+
+
+@router.post("/wallet/claims/claim-all", response_model=ClaimAllHoldsResponse)
+async def claim_all_holds(
+    current_user: Annotated[User, Depends(get_current_user)],
+    service: Annotated[WalletService, Depends(get_wallet_service)],
+) -> ClaimAllHoldsResponse:
+    return await service.claim_all_holds(user_id=current_user.id)
+
+
+@router.post("/wallet/claims/{hold_id}", response_model=ClaimHoldResponse)
+async def claim_hold_manually(
+    hold_id: uuid.UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    service: Annotated[WalletService, Depends(get_wallet_service)],
+) -> ClaimHoldResponse:
+    return await service.claim_hold_manually(
+        user_id=current_user.id,
+        hold_id=hold_id,
     )
 
 

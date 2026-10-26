@@ -142,3 +142,101 @@ class WalletRepository:
         )
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
+
+    async def get_ledger_entry_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> WalletLedgerEntry | None:
+        stmt = select(WalletLedgerEntry).where(WalletLedgerEntry.idempotency_key == idempotency_key)
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_hold_by_id(
+        self,
+        hold_id: uuid.UUID,
+        for_update: bool = False,
+    ) -> WalletHold | None:
+        stmt = select(WalletHold).where(WalletHold.id == hold_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_active_hold_for_lot(
+        self,
+        lot_id: uuid.UUID,
+        for_update: bool = False,
+    ) -> WalletHold | None:
+        stmt = select(WalletHold).where(
+            WalletHold.lot_id == lot_id,
+            WalletHold.status == WalletHoldStatus.ACTIVE_HOLD,
+        )
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def create_hold(
+        self,
+        wallet_id: uuid.UUID,
+        user_id: uuid.UUID,
+        lot_id: uuid.UUID,
+        amount: Decimal,
+        status: WalletHoldStatus,
+        created_at: datetime,
+    ) -> WalletHold:
+        hold = WalletHold(
+            wallet_id=wallet_id,
+            user_id=user_id,
+            lot_id=lot_id,
+            amount=amount,
+            status=status,
+            created_at=created_at,
+        )
+        self._session.add(hold)
+        await self._session.flush()
+        return hold
+
+    async def list_claimable_holds_for_user(
+        self,
+        user_id: uuid.UUID,
+        for_update: bool = False,
+    ) -> list[WalletHold]:
+        stmt = (
+            select(WalletHold)
+            .where(
+                WalletHold.user_id == user_id,
+                WalletHold.status == WalletHoldStatus.CLAIMABLE,
+            )
+            .order_by(WalletHold.created_at.asc(), WalletHold.id.asc())
+        )
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_lot_title(
+        self,
+        lot_id: uuid.UUID,
+    ) -> str:
+        stmt = select(Lot.title).where(Lot.id == lot_id)
+        result = await self._session.execute(stmt)
+        title = result.scalar_one_or_none()
+        return str(title) if title is not None else ""
+
+    async def lock_wallets_by_user_ids(
+        self,
+        user_ids: list[uuid.UUID],
+    ) -> dict[uuid.UUID, Wallet]:
+        ordered_ids = sorted(set(user_ids))
+        for uid in ordered_ids:
+            await self.get_or_create_wallet(user_id=uid, for_update=False)
+        stmt = (
+            select(Wallet)
+            .where(Wallet.user_id.in_(ordered_ids))
+            .order_by(Wallet.user_id.asc())
+            .with_for_update()
+        )
+        result = await self._session.execute(stmt)
+        wallets = list(result.scalars().all())
+        return {w.user_id: w for w in wallets}
