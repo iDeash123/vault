@@ -1,6 +1,6 @@
 import React, { useState } from "react";
-import { Link, useLocation } from "react-router-dom";
-import { apiClient } from "../../shared/api/client";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { ApiClientError, apiClient } from "../../shared/api/client";
 import { useAuthStore } from "../../shared/store/authStore";
 import { useClockStore } from "../../shared/store/clockStore";
 import { ReticleFrame, UnborderedWord } from "../../shared/ui/BrandGlyphs";
@@ -18,13 +18,16 @@ export interface AppShellProps {
 
 export const AppShell: React.FC<AppShellProps> = ({ children }) => {
   const location = useLocation();
+  const navigate = useNavigate();
   const user = useAuthStore((state) => state.user);
   const claimableCount = useAuthStore((state) => state.claimableCount);
   const updateBalances = useAuthStore((state) => state.updateBalances);
   const setClaimableCount = useAuthStore((state) => state.setClaimableCount);
+  const clearSession = useAuthStore((state) => state.clearSession);
   const clockOffsetMs = useClockStore((state) => state.clockOffsetMs);
   const [showGridOverlay, setShowGridOverlay] = useState<boolean>(false);
   const [isClaimingAll, setIsClaimingAll] = useState<boolean>(false);
+  const [globalClaimError, setGlobalClaimError] = useState<string>("");
 
   const visibleNavItems = NAV_ITEMS.filter((item) => {
     if (item.allowedRoles !== undefined) {
@@ -37,6 +40,7 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
     if (user === null) {
       return;
     }
+    setGlobalClaimError("");
     setIsClaimingAll(true);
     try {
       const result = await apiClient.post<{
@@ -50,8 +54,30 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
         claimable_balance: result.claimable_balance,
       });
       setClaimableCount(0);
+    } catch (err: unknown) {
+      if (err instanceof ApiClientError) {
+        setGlobalClaimError(err.message);
+      } else {
+        setGlobalClaimError("Failed to claim all outbid holds.");
+      }
     } finally {
       setIsClaimingAll(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await apiClient.post("/auth/logout");
+    } catch {
+      clearSession();
+      if (location.pathname === "/wallet") {
+        void navigate("/login");
+      }
+      return;
+    }
+    clearSession();
+    if (location.pathname === "/wallet") {
+      void navigate("/login");
     }
   };
 
@@ -85,6 +111,25 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
           onClaimAll={handleGlobalClaimAll}
           isClaiming={isClaimingAll}
         />
+      )}
+
+      {globalClaimError.length > 0 && (
+        <div
+          role="alert"
+          data-testid="global-claim-error-banner"
+          className="border-b border-[#262626] bg-[#141414] px-6 py-2 text-xs font-mono-tech text-[#F5F5F5] flex items-center justify-between"
+        >
+          <span>[CLAIM_ERROR] {globalClaimError}</span>
+          <button
+            type="button"
+            onClick={() => {
+              setGlobalClaimError("");
+            }}
+            className="text-[10px] uppercase text-[#A6A6A6] hover:text-[#F5F5F5]"
+          >
+            DISMISS [X]
+          </button>
+        </div>
       )}
 
       <header className="border-b border-[#262626] bg-[#141414] sticky top-0 z-30">
@@ -127,6 +172,15 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
                       CLAIMABLE: ${user.claimable_balance}
                     </span>
                   )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void handleLogout();
+                    }}
+                    className="rounded-none border border-[#262626] px-2 py-0.5 text-[10px] uppercase text-[#A6A6A6] hover:border-[#F5F5F5] hover:text-[#F5F5F5]"
+                  >
+                    LOGOUT
+                  </button>
                 </div>
               ) : (
                 <Link
