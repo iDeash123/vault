@@ -1,7 +1,8 @@
 import uuid
+from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from adapters.storage_s3 import S3StorageAdapter
@@ -9,12 +10,15 @@ from core.clock import ClockPort
 from domains.auth.dependencies import get_clock, get_current_user
 from domains.lots.schemas import (
     CreateLotRequest,
+    LotCatalogResponse,
+    LotDetailResponse,
     LotMediaUploadResponse,
     LotResponse,
+    LotSortOrder,
 )
 from domains.lots.service import LotService
 from ports.storage_port import StoragePort
-from shared.db.models.enums import MediaSlotType
+from shared.db.models.enums import LotCategory, LotStatus, MediaSlotType
 from shared.db.models.user import User
 from shared.db.session import get_db_session
 
@@ -35,6 +39,48 @@ def get_lot_service(
         clock=clock,
         storage=storage,
     )
+
+
+@router.get(
+    "/lots",
+    response_model=LotCatalogResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def list_lots(
+    service: Annotated[LotService, Depends(get_lot_service)],
+    q: Annotated[str | None, Query(max_length=100)] = None,
+    category: Annotated[LotCategory | None, Query()] = None,
+    lot_status: Annotated[LotStatus | None, Query(alias="status")] = None,
+    min_price: Annotated[Decimal | None, Query(ge=Decimal("0.00"))] = None,
+    max_price: Annotated[Decimal | None, Query(ge=Decimal("0.00"))] = None,
+    sort: Annotated[LotSortOrder | None, Query()] = None,
+    sort_by: Annotated[LotSortOrder | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> LotCatalogResponse:
+    effective_sort = sort or sort_by or LotSortOrder.ENDING_SOON
+    return await service.get_catalog(
+        q=q,
+        category=category,
+        status=lot_status,
+        min_price=min_price,
+        max_price=max_price,
+        sort=effective_sort,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/lots/{lot_id}",
+    response_model=LotDetailResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_lot_detail(
+    lot_id: uuid.UUID,
+    service: Annotated[LotService, Depends(get_lot_service)],
+) -> LotDetailResponse:
+    return await service.get_lot_detail(lot_id=lot_id)
 
 
 @router.post(

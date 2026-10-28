@@ -9,12 +9,17 @@ from core.exceptions import ConflictError, DomainError, ForbiddenError, NotFound
 from domains.lots.repository import LotRepository
 from domains.lots.schemas import (
     CreateLotRequest,
+    LotBidItemResponse,
+    LotCatalogResponse,
+    LotDetailResponse,
     LotMediaItemResponse,
     LotMediaUploadResponse,
     LotResponse,
+    LotSortOrder,
 )
 from ports.storage_port import StoragePort, validate_image_bytes
-from shared.db.models.enums import LotStatus, MediaSlotType
+from shared.db.models.bid import Bid
+from shared.db.models.enums import LotCategory, LotStatus, MediaSlotType
 from shared.db.models.lot import Lot, LotMedia
 from shared.schemas.specs import LotSpecs, lot_specs_adapter
 
@@ -24,6 +29,14 @@ MANDATORY_MEDIA_SLOTS = {
     MediaSlotType.DEFECT,
     MediaSlotType.DETAIL,
 }
+
+
+def mask_username(username: str) -> str:
+    if not username:
+        return "***"
+    if len(username) == 1:
+        return f"{username}***"
+    return f"{username[0]}***{username[-1]}"
 
 
 class LotService:
@@ -95,6 +108,51 @@ class LotService:
             ends_at=lot.ends_at,
             media=media_items,
             server_time=self.clock.now(),
+        )
+
+    def build_lot_detail_response(
+        self,
+        lot: Lot,
+        bids_with_users: list[tuple[Bid, str]],
+    ) -> LotDetailResponse:
+        base_resp = self.build_lot_response(lot)
+        bid_items = [
+            LotBidItemResponse(
+                id=b.id,
+                bidder_id=b.bidder_id,
+                bidder_username_masked=mask_username(uname),
+                amount=b.amount,
+                is_buy_now=b.is_buy_now,
+                triggered_anti_snipe=b.triggered_anti_snipe,
+                created_at=b.created_at,
+            )
+            for b, uname in bids_with_users
+        ]
+        return LotDetailResponse(
+            id=base_resp.id,
+            seller_id=base_resp.seller_id,
+            leader_user_id=base_resp.leader_user_id,
+            category=base_resp.category,
+            status=base_resp.status,
+            title=base_resp.title,
+            subtitle=base_resp.subtitle,
+            description=base_resp.description,
+            specs=base_resp.specs,
+            start_price=base_resp.start_price,
+            reserve_price=base_resp.reserve_price,
+            buy_now_price=base_resp.buy_now_price,
+            min_bid_increment=base_resp.min_bid_increment,
+            current_price=base_resp.current_price,
+            min_valid_bid=base_resp.min_valid_bid,
+            bid_count=base_resp.bid_count,
+            is_buy_now_available=base_resp.is_buy_now_available,
+            is_reserve_met=base_resp.is_reserve_met,
+            anti_snipe_extensions_count=base_resp.anti_snipe_extensions_count,
+            starts_at=base_resp.starts_at,
+            ends_at=base_resp.ends_at,
+            media=base_resp.media,
+            server_time=base_resp.server_time,
+            bids=bid_items,
         )
 
     async def create_lot_draft(
@@ -191,6 +249,8 @@ class LotService:
         slot_type: MediaSlotType,
         file_bytes: bytes,
     ) -> LotMediaUploadResponse:
+        detected_mime = validate_image_bytes(file_bytes)
+
         lot = await self.repository.get_lot_by_id_for_update(lot_id)
         if lot is None:
             raise NotFoundError(message="Lot not found", error_code="LOT_NOT_FOUND")
@@ -207,14 +267,14 @@ class LotService:
                 error_code="LOT_NOT_IN_DRAFT",
             )
 
-        if len(lot.media) >= 8:
+        media_count = await self.repository.count_media(lot.id)
+        if media_count >= 8:
             raise DomainError(
                 message="Lot cannot have more than 8 media items",
                 error_code="LOT_MEDIA_LIMIT_EXCEEDED",
                 status_code=400,
             )
 
-        detected_mime = validate_image_bytes(file_bytes)
         ext = "jpg"
         if detected_mime == "image/png":
             ext = "png"
@@ -229,7 +289,7 @@ class LotService:
             content_type=detected_mime,
         )
 
-        sort_order = len(lot.media)
+        sort_order = media_count
         media = LotMedia(
             id=media_id,
             lot_id=lot.id,
@@ -277,7 +337,7 @@ class LotService:
                 error_code="LOT_NOT_IN_DRAFT",
             )
 
-        media_list = lot.media
+        media_list = await self.repository.get_lot_media(lot.id)
         count = len(media_list)
         if count < 4:
             raise DomainError(
@@ -318,3 +378,49 @@ class LotService:
             raise NotFoundError(message="Lot not found", error_code="LOT_NOT_FOUND")
 
         return self.build_lot_response(refreshed_lot)
+
+    async def get_lot_detail(self, lot_id: uuid.UUID) -> LotDetailResponse:
+        lot = await self.repository.get_lot_by_id(lot_id)
+        if lot is None:
+            raise NotFoundError(message="Lot not found", error_code="LOT_NOT_FOUND")
+
+        bids_with_users = await self.repository.get_lot_recent_bids(lot_id=lot.id, limit=20)
+        return self.build_lot_detail_response(lot=lot, bids_with_users=bids_with_users)
+
+    async def get_catalog(
+        self,
+        q: str | None = None,
+        category: LotCategory | None = None,
+        status: LotStatus | None = None,
+        min_price: Decimal | None = None,
+        max_price: Decimal | None = None,
+        sort: LotSortOrder = LotSortOrder.ENDING_SOON,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> LotCatalogResponse:
+        if min_price is not None and max_price is not None and min_price > max_price:
+            raise DomainError(
+                message="min_price cannot exceed max_price",
+                error_code="INVALID_PRICE_RANGE",
+                status_code=400,
+            )
+
+        lots, total = await self.repository.list_lots(
+            q=q,
+            category=category,
+            status=status,
+            min_price=min_price,
+            max_price=max_price,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+        )
+
+        items = [self.build_lot_response(lot) for lot in lots]
+        return LotCatalogResponse(
+            items=items,
+            total=total,
+            limit=limit,
+            offset=offset,
+            server_time=self.clock.now(),
+        )

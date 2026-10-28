@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Decimal
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -8,8 +9,16 @@ from shared.db.models.enums import LotCategory, LotStatus, MediaSlotType
 from shared.schemas.specs import LotSpecs
 
 
+class LotSortOrder(StrEnum):
+    ENDING_SOON = "ending_soon"
+    HOT_BIDS = "hot_bids"
+    NEWEST = "newest"
+    PRICE_ASC = "price_asc"
+    PRICE_DESC = "price_desc"
+
+
 class CreateLotRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     category: LotCategory
     title: str = Field(min_length=1, max_length=200)
@@ -66,6 +75,18 @@ class LotMediaUploadResponse(BaseModel):
     server_time: datetime
 
 
+class LotBidItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    bidder_id: uuid.UUID
+    bidder_username_masked: str
+    amount: Decimal
+    is_buy_now: bool
+    triggered_anti_snipe: bool
+    created_at: datetime
+
+
 class LotResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -91,4 +112,18 @@ class LotResponse(BaseModel):
     starts_at: datetime
     ends_at: datetime
     media: list[LotMediaItemResponse]
+    server_time: datetime
+
+
+class LotDetailResponse(LotResponse):
+    bids: list[LotBidItemResponse] = Field(default_factory=list)
+
+
+class LotCatalogResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[LotResponse]
+    total: int
+    limit: int
+    offset: int
     server_time: datetime
