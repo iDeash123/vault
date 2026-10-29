@@ -10,10 +10,16 @@ from core.clock import ClockPort
 from core.config import Settings, get_settings
 from core.exceptions import ConflictError, DomainError, ForbiddenError, NotFoundError
 from domains.bidding.repository import BiddingRepository
-from domains.bidding.schemas import BidResponse, PlaceBidRequest
+from domains.bidding.schemas import BidResponse, BuyNowResponse, PlaceBidRequest
 from ports.realtime_port import RealtimeBrokerPort
 from shared.db.models.bid import Bid
-from shared.db.models.enums import LedgerEntryType, LotStatus, WalletHoldStatus
+from shared.db.models.enums import (
+    EscrowOrderStatus,
+    LedgerEntryType,
+    LotStatus,
+    WalletHoldStatus,
+)
+from shared.db.models.escrow import EscrowOrder
 from shared.db.models.wallet import WalletHold, WalletLedgerEntry
 
 TWO_PLACES = Decimal("0.01")
@@ -473,5 +479,308 @@ class BiddingService:
             anti_snipe_extensions_count=extensions_count_val,
             is_buy_now_available=is_buy_now_avail,
             is_reserve_met=is_res_met,
+            server_time=now,
+        )
+
+    async def buy_now(
+        self,
+        lot_id: uuid.UUID,
+        buyer_id: uuid.UUID,
+        idempotency_key: str,
+    ) -> BuyNowResponse:
+        cleaned_key = validate_idempotency_key(idempotency_key)
+
+        lot = await self.repo.get_lot_for_update(lot_id)
+        if lot is None:
+            raise NotFoundError(message="Lot not found", error_code="LOT_NOT_FOUND")
+
+        existing_bid = await self.repo.get_bid_by_idempotency_key(cleaned_key)
+        if existing_bid is not None:
+            if (
+                existing_bid.lot_id != lot_id
+                or existing_bid.bidder_id != buyer_id
+                or not existing_bid.is_buy_now
+                or (
+                    lot.buy_now_price is not None
+                    and quantize_usd(existing_bid.amount) != quantize_usd(lot.buy_now_price)
+                )
+            ):
+                raise ConflictError(
+                    message="Idempotency key already used with different parameters",
+                    error_code="IDEMPOTENCY_KEY_CONFLICT",
+                )
+            order = await self.repo.get_escrow_order_by_lot_id(lot_id)
+            if order is None:
+                raise ConflictError(
+                    message="Order for this buy-now lot not found",
+                    error_code="ORDER_NOT_FOUND",
+                )
+            return BuyNowResponse(
+                order_id=order.id,
+                lot_id=lot.id,
+                buyer_id=buyer_id,
+                seller_id=lot.seller_id,
+                bid_id=existing_bid.id,
+                wallet_hold_id=existing_bid.wallet_hold_id,
+                amount=quantize_usd(existing_bid.amount),
+                platform_fee_amount=quantize_usd(order.platform_fee_amount),
+                seller_payout_amount=quantize_usd(order.seller_payout_amount),
+                lot_status=lot.status,
+                order_status=order.status,
+                server_time=self.clock.now(),
+            )
+
+        if lot.seller_id == buyer_id:
+            raise ForbiddenError(
+                message="Sellers cannot buy their own lot",
+                error_code="SELF_BIDDING_FORBIDDEN",
+            )
+
+        if lot.status != LotStatus.LIVE:
+            raise ConflictError(
+                message=f"Lot is not live (current status: {lot.status})",
+                error_code="LOT_NOT_LIVE",
+            )
+
+        now = self.clock.now()
+        if now < lot.starts_at:
+            raise ConflictError(
+                message="Auction has not started yet",
+                error_code="LOT_NOT_STARTED",
+            )
+        if now >= lot.ends_at:
+            raise ConflictError(
+                message="Auction has already ended",
+                error_code="LOT_ALREADY_ENDED",
+            )
+
+        is_avail = compute_is_buy_now_available(
+            status=lot.status,
+            buy_now_price=lot.buy_now_price,
+            reserve_price=lot.reserve_price,
+            current_price=lot.current_price,
+            min_bid_increment=lot.min_bid_increment,
+            bid_count=lot.bid_count,
+        )
+        if not is_avail:
+            raise ConflictError(
+                message="Buy-now option is no longer available for this lot",
+                error_code="BUY_NOW_UNAVAILABLE",
+            )
+
+        assert lot.buy_now_price is not None
+        buy_now_amount = quantize_usd(lot.buy_now_price)
+
+        active_hold = await self.repo.get_active_hold_for_lot_for_update(lot_id)
+
+        user_ids = [buyer_id]
+        if active_hold is not None:
+            user_ids.append(active_hold.user_id)
+        wallets = await self.repo.get_wallets_for_update(user_ids)
+        buyer_wallet = wallets[buyer_id]
+
+        avail = quantize_usd(buyer_wallet.available_balance)
+        claimable = quantize_usd(buyer_wallet.claimable_balance)
+        if avail < buy_now_amount:
+            msg = (
+                f"Available balance {avail} USD is less than "
+                f"required buy now price {buy_now_amount} USD."
+            )
+            if claimable > Decimal("0.00"):
+                msg = (
+                    f"{msg} Note: you have {claimable} USD in claimable outbid holds "
+                    "that can be manually claimed."
+                )
+            raise DomainError(
+                message=msg,
+                error_code="INSUFFICIENT_AVAILABLE_BALANCE",
+                status_code=400,
+                details={
+                    "available_balance": str(avail),
+                    "claimable_balance": str(claimable),
+                    "required_amount": str(buy_now_amount),
+                },
+            )
+
+        previous_hold_info: tuple[uuid.UUID, uuid.UUID, Decimal, Decimal] | None = None
+        try:
+            if active_hold is not None:
+                prev_wallet = wallets[active_hold.user_id]
+                prev_amount = quantize_usd(active_hold.amount)
+                active_hold.status = WalletHoldStatus.CLAIMABLE
+                active_hold.outbid_at = now
+                prev_wallet.held_balance = quantize_usd(
+                    Decimal(prev_wallet.held_balance) - prev_amount
+                )
+                prev_wallet.claimable_balance = quantize_usd(
+                    Decimal(prev_wallet.claimable_balance) + prev_amount
+                )
+                prev_wallet.updated_at = now
+                await self.repo.create_ledger_entry(
+                    WalletLedgerEntry(
+                        wallet_id=prev_wallet.id,
+                        user_id=active_hold.user_id,
+                        entry_type=LedgerEntryType.BID_OUTBID_TO_CLAIMABLE,
+                        amount=prev_amount,
+                        available_delta=Decimal("0.00"),
+                        held_delta=-prev_amount,
+                        claimable_delta=prev_amount,
+                        balance_available_after=quantize_usd(prev_wallet.available_balance),
+                        balance_held_after=quantize_usd(prev_wallet.held_balance),
+                        balance_claimable_after=quantize_usd(prev_wallet.claimable_balance),
+                        reference_lot_id=lot.id,
+                        reference_hold_id=active_hold.id,
+                        idempotency_key=make_ledger_idempotency_key(
+                            f"outbid:{active_hold.id}", cleaned_key
+                        ),
+                        created_at=now,
+                    )
+                )
+                previous_hold_info = (
+                    active_hold.id,
+                    active_hold.user_id,
+                    prev_amount,
+                    quantize_usd(prev_wallet.claimable_balance),
+                )
+
+            buyer_wallet.available_balance = quantize_usd(
+                Decimal(buyer_wallet.available_balance) - buy_now_amount
+            )
+            buyer_wallet.held_balance = quantize_usd(
+                Decimal(buyer_wallet.held_balance) + buy_now_amount
+            )
+            buyer_wallet.updated_at = now
+
+            buyer_hold = WalletHold(
+                wallet_id=buyer_wallet.id,
+                user_id=buyer_id,
+                lot_id=lot.id,
+                amount=buy_now_amount,
+                status=WalletHoldStatus.CAPTURED_TO_ESCROW,
+                captured_at=now,
+                created_at=now,
+            )
+            await self.repo.create_hold(buyer_hold)
+
+            await self.repo.create_ledger_entry(
+                WalletLedgerEntry(
+                    wallet_id=buyer_wallet.id,
+                    user_id=buyer_id,
+                    entry_type=LedgerEntryType.BUY_NOW_LOCK,
+                    amount=buy_now_amount,
+                    available_delta=-buy_now_amount,
+                    held_delta=buy_now_amount,
+                    claimable_delta=Decimal("0.00"),
+                    balance_available_after=quantize_usd(buyer_wallet.available_balance),
+                    balance_held_after=quantize_usd(buyer_wallet.held_balance),
+                    balance_claimable_after=quantize_usd(buyer_wallet.claimable_balance),
+                    reference_lot_id=lot.id,
+                    reference_hold_id=buyer_hold.id,
+                    idempotency_key=make_ledger_idempotency_key("buy_now_lock", cleaned_key),
+                    created_at=now,
+                )
+            )
+
+            bid = Bid(
+                lot_id=lot.id,
+                bidder_id=buyer_id,
+                wallet_hold_id=buyer_hold.id,
+                amount=buy_now_amount,
+                is_buy_now=True,
+                triggered_anti_snipe=False,
+                idempotency_key=cleaned_key,
+                created_at=now,
+            )
+            await self.repo.create_bid(bid)
+
+            lot.status = LotStatus.ENDED_WON
+            lot.current_price = buy_now_amount
+            lot.bid_count += 1
+            lot.leader_user_id = buyer_id
+            lot.version += 1
+            lot.updated_at = now
+
+            fee_rate = Decimal(str(self.settings.PLATFORM_FEE_PERCENT)) / Decimal("100.00")
+            platform_fee = quantize_usd(buy_now_amount * fee_rate)
+            seller_payout = quantize_usd(buy_now_amount - platform_fee)
+
+            order = EscrowOrder(
+                lot_id=lot.id,
+                buyer_id=buyer_id,
+                seller_id=lot.seller_id,
+                wallet_hold_id=buyer_hold.id,
+                final_amount=buy_now_amount,
+                platform_fee_amount=platform_fee,
+                seller_payout_amount=seller_payout,
+                status=EscrowOrderStatus.FUNDS_HELD,
+            )
+            await self.repo.create_escrow_order(order)
+
+            lot_id_val = lot.id
+            lot_title_val = lot.title
+            seller_id_val = lot.seller_id
+            order_id_val = order.id
+            bid_id_val = bid.id
+            hold_id_val = buyer_hold.id
+
+            await self.session.commit()
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise ConflictError(
+                message="Idempotency key already used with different parameters",
+                error_code="IDEMPOTENCY_KEY_CONFLICT",
+            ) from exc
+
+        await self.realtime_broker.broadcast_lot_event(
+            lot_id_val,
+            {
+                "event_type": "LOT_SOLD",
+                "lot_id": str(lot_id_val),
+                "winner_user_id": str(buyer_id),
+                "final_price": str(buy_now_amount),
+                "via_buy_now": True,
+                "server_time": now.isoformat(),
+            },
+        )
+
+        if previous_hold_info is not None:
+            prev_hold_id, prev_user_id, prev_amt, prev_claimable = previous_hold_info
+            await self.realtime_broker.send_user_notification(
+                prev_user_id,
+                {
+                    "event_type": "HOLD_BECAME_CLAIMABLE",
+                    "hold_id": str(prev_hold_id),
+                    "lot_id": str(lot_id_val),
+                    "lot_title": lot_title_val,
+                    "amount": str(prev_amt),
+                    "reason": "OUTBID",
+                    "new_claimable_balance": str(prev_claimable),
+                    "server_time": now.isoformat(),
+                },
+            )
+
+        await self.realtime_broker.send_user_notification(
+            buyer_id,
+            {
+                "event_type": "LOT_WON",
+                "lot_id": str(lot_id_val),
+                "order_id": str(order_id_val),
+                "final_amount": str(buy_now_amount),
+                "server_time": now.isoformat(),
+            },
+        )
+
+        return BuyNowResponse(
+            order_id=order_id_val,
+            lot_id=lot_id_val,
+            buyer_id=buyer_id,
+            seller_id=seller_id_val,
+            bid_id=bid_id_val,
+            wallet_hold_id=hold_id_val,
+            amount=buy_now_amount,
+            platform_fee_amount=platform_fee,
+            seller_payout_amount=seller_payout,
+            lot_status=LotStatus.ENDED_WON,
+            order_status=EscrowOrderStatus.FUNDS_HELD,
             server_time=now,
         )

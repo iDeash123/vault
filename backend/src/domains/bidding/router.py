@@ -10,7 +10,7 @@ from core.clock import ClockPort
 from core.config import get_settings
 from core.exceptions import DomainError
 from domains.auth.dependencies import get_clock, get_current_user
-from domains.bidding.schemas import BidResponse, PlaceBidRequest
+from domains.bidding.schemas import BidResponse, BuyNowResponse, PlaceBidRequest
 from domains.bidding.service import BiddingService
 from ports.realtime_port import RealtimeBrokerPort
 from shared.db.models.user import User
@@ -68,5 +68,29 @@ async def place_bid_endpoint(
         lot_id=lot_id,
         bidder_id=current_user.id,
         payload=payload,
+        idempotency_key=idempotency_key,
+    )
+
+
+@router.post(
+    "/lots/{lot_id}/buy-now",
+    response_model=BuyNowResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def buy_now_endpoint(
+    lot_id: uuid.UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    service: Annotated[BiddingService, Depends(get_bidding_service)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> BuyNowResponse:
+    if not idempotency_key or not idempotency_key.strip():
+        raise DomainError(
+            message="Idempotency-Key header is required",
+            error_code="MISSING_IDEMPOTENCY_KEY",
+            status_code=400,
+        )
+    return await service.buy_now(
+        lot_id=lot_id,
+        buyer_id=current_user.id,
         idempotency_key=idempotency_key,
     )
