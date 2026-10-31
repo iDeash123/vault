@@ -1,7 +1,8 @@
+import contextlib
 import json
 import uuid
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 
@@ -19,7 +20,7 @@ class RedisRealtimeBrokerAdapter(RealtimeBrokerPort):
         )
 
     async def publish(self, channel: str, message: dict[str, Any]) -> None:
-        serialized = json.dumps(message).encode("utf-8")
+        serialized = json.dumps(message, default=str).encode("utf-8")
         await self._client.publish(channel, serialized)
 
     async def subscribe(self, channel: str) -> AsyncGenerator[dict[str, Any], None]:
@@ -36,8 +37,10 @@ class RedisRealtimeBrokerAdapter(RealtimeBrokerPort):
                         decoded_str: dict[str, Any] = json.loads(payload)
                         yield decoded_str
         finally:
-            await pubsub.unsubscribe(channel)
-            await pubsub.close()
+            with contextlib.suppress(Exception):
+                await pubsub.unsubscribe(channel)
+            with contextlib.suppress(Exception):
+                await cast("Any", pubsub).aclose()
 
     async def broadcast_lot_event(
         self,

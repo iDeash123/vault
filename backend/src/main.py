@@ -14,6 +14,7 @@ from core.exceptions import DomainError
 from domains.auth.dependencies import get_clock
 from domains.auth.router import router as auth_router
 from domains.bidding.router import router as bidding_router
+from domains.bidding.ws_router import router as ws_router
 from domains.lots.router import router as lots_router
 from domains.wallet.router import router as wallet_router
 from shared.db.session import dispose_engine, get_engine
@@ -113,6 +114,7 @@ def create_app() -> FastAPI:
     app.include_router(wallet_router)
     app.include_router(lots_router)
     app.include_router(bidding_router)
+    app.include_router(ws_router)
 
     return app
 

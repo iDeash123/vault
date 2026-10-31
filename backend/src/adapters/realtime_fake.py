@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncGenerator
@@ -13,10 +14,11 @@ class InMemoryRealtimeBrokerAdapter(RealtimeBrokerPort):
         self._subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = defaultdict(list)
 
     async def publish(self, channel: str, message: dict[str, Any]) -> None:
-        self.published_events.append((channel, dict(message)))
+        serialized: dict[str, Any] = json.loads(json.dumps(message, default=str))
+        self.published_events.append((channel, serialized))
         queues = list(self._subscribers.get(channel, []))
         for queue in queues:
-            await queue.put(dict(message))
+            await queue.put(dict(serialized))
 
     async def subscribe(self, channel: str) -> AsyncGenerator[dict[str, Any], None]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -47,3 +49,6 @@ class InMemoryRealtimeBrokerAdapter(RealtimeBrokerPort):
         if channel is None:
             return [evt for _, evt in self.published_events]
         return [evt for ch, evt in self.published_events if ch == channel]
+
+    async def close(self) -> None:
+        self._subscribers.clear()
