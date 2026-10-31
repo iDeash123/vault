@@ -1,7 +1,8 @@
 import hashlib
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
+from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -784,3 +785,195 @@ class BiddingService:
             order_status=EscrowOrderStatus.FUNDS_HELD,
             server_time=now,
         )
+
+    async def finalize_lot(
+        self,
+        lot_id: uuid.UUID,
+        expected_ends_at_iso: str | None = None,
+    ) -> dict[str, Any]:
+        lot = await self.repo.get_lot_for_update(lot_id)
+        if lot is None:
+            return {"status": "NOOP", "reason": "LOT_NOT_FOUND"}
+
+        if lot.status != LotStatus.LIVE:
+            return {
+                "status": "NOOP",
+                "reason": "LOT_NOT_LIVE",
+                "current_status": lot.status.value,
+            }
+
+        now = self.clock.now()
+        is_extended_by_anti_snipe = lot.ends_at > now
+        if expected_ends_at_iso is not None and not is_extended_by_anti_snipe:
+            expected_clean = expected_ends_at_iso.replace("Z", "+00:00")
+            try:
+                expected_dt = datetime.fromisoformat(expected_clean)
+                if expected_dt.tzinfo is None:
+                    expected_dt = expected_dt.replace(tzinfo=UTC)
+                if lot.ends_at > expected_dt:
+                    is_extended_by_anti_snipe = True
+            except (ValueError, TypeError):
+                expected_dt = None
+        if is_extended_by_anti_snipe:
+            return {
+                "status": "NOOP",
+                "reason": "ANTI_SNIPE_EXTENDED",
+                "ends_at": lot.ends_at.isoformat(),
+            }
+
+        active_hold = await self.repo.get_active_hold_for_lot_for_update(lot.id)
+        threshold = lot.reserve_price if lot.reserve_price is not None else lot.start_price
+        is_won = (
+            lot.bid_count > 0 and lot.leader_user_id is not None and lot.current_price >= threshold
+        )
+
+        lot_id_val = lot.id
+        final_price_val = quantize_usd(lot.current_price)
+
+        if is_won:
+            winner_id = lot.leader_user_id
+            if winner_id is None:
+                return {"status": "NOOP", "reason": "WINNER_NOT_FOUND"}
+
+            if active_hold is not None:
+                active_hold.status = WalletHoldStatus.CAPTURED_TO_ESCROW
+                active_hold.captured_at = now
+
+            lot.status = LotStatus.ENDED_WON
+            lot.updated_at = now
+            lot.version += 1
+
+            order = await self.repo.get_escrow_order_by_lot_id(lot_id_val)
+            if order is None:
+                fee_rate = Decimal(str(self.settings.PLATFORM_FEE_PERCENT)) / Decimal("100.00")
+                platform_fee = quantize_usd(final_price_val * fee_rate)
+                seller_payout = quantize_usd(final_price_val - platform_fee)
+                hold_id_for_order = active_hold.id if active_hold is not None else uuid.uuid4()
+                order = EscrowOrder(
+                    lot_id=lot_id_val,
+                    buyer_id=winner_id,
+                    seller_id=lot.seller_id,
+                    wallet_hold_id=hold_id_for_order,
+                    final_amount=final_price_val,
+                    platform_fee_amount=platform_fee,
+                    seller_payout_amount=seller_payout,
+                    status=EscrowOrderStatus.FUNDS_HELD,
+                )
+                await self.repo.create_escrow_order(order)
+
+            order_id_val = order.id
+            await self.session.commit()
+
+            await self.realtime_broker.broadcast_lot_event(
+                lot_id_val,
+                {
+                    "event_type": "LOT_ENDED",
+                    "lot_id": str(lot_id_val),
+                    "status": LotStatus.ENDED_WON.value,
+                    "winner_user_id": str(winner_id),
+                    "final_price": str(final_price_val),
+                    "server_time": now.isoformat(),
+                },
+            )
+
+            await self.realtime_broker.send_user_notification(
+                winner_id,
+                {
+                    "event_type": "LOT_WON",
+                    "lot_id": str(lot_id_val),
+                    "order_id": str(order_id_val),
+                    "final_amount": str(final_price_val),
+                    "server_time": now.isoformat(),
+                },
+            )
+
+            return {
+                "status": "ENDED_WON",
+                "lot_id": str(lot_id_val),
+                "winner_user_id": str(winner_id),
+                "final_price": str(final_price_val),
+                "order_id": str(order_id_val),
+            }
+
+        released_info: tuple[uuid.UUID, uuid.UUID, str, Decimal, Decimal] | None = None
+        if active_hold is not None:
+            wallets_map = await self.repo.get_wallets_for_update([active_hold.user_id])
+            leader_wallet = wallets_map[active_hold.user_id]
+            hold_amount = quantize_usd(active_hold.amount)
+
+            active_hold.status = WalletHoldStatus.CLAIMABLE
+            active_hold.outbid_at = now
+
+            leader_wallet.held_balance = quantize_usd(
+                Decimal(leader_wallet.held_balance) - hold_amount
+            )
+            leader_wallet.claimable_balance = quantize_usd(
+                Decimal(leader_wallet.claimable_balance) + hold_amount
+            )
+            leader_wallet.updated_at = now
+
+            ledger_key = make_ledger_idempotency_key("unsold_release", str(active_hold.id))
+            await self.repo.create_ledger_entry(
+                WalletLedgerEntry(
+                    wallet_id=leader_wallet.id,
+                    user_id=active_hold.user_id,
+                    entry_type=LedgerEntryType.BID_RELEASED_TO_CLAIMABLE,
+                    amount=hold_amount,
+                    available_delta=Decimal("0.00"),
+                    held_delta=-hold_amount,
+                    claimable_delta=hold_amount,
+                    balance_available_after=quantize_usd(leader_wallet.available_balance),
+                    balance_held_after=quantize_usd(leader_wallet.held_balance),
+                    balance_claimable_after=quantize_usd(leader_wallet.claimable_balance),
+                    reference_lot_id=lot_id_val,
+                    reference_hold_id=active_hold.id,
+                    idempotency_key=ledger_key,
+                    created_at=now,
+                )
+            )
+            released_info = (
+                active_hold.id,
+                active_hold.user_id,
+                lot.title,
+                hold_amount,
+                quantize_usd(leader_wallet.claimable_balance),
+            )
+
+        lot.status = LotStatus.ENDED_UNSOLD
+        lot.updated_at = now
+        lot.version += 1
+        await self.session.commit()
+
+        await self.realtime_broker.broadcast_lot_event(
+            lot_id_val,
+            {
+                "event_type": "LOT_ENDED",
+                "lot_id": str(lot_id_val),
+                "status": LotStatus.ENDED_UNSOLD.value,
+                "winner_user_id": None,
+                "final_price": str(final_price_val),
+                "server_time": now.isoformat(),
+            },
+        )
+
+        if released_info is not None:
+            r_hold_id, r_user_id, r_title, r_amount, r_claimable = released_info
+            await self.realtime_broker.send_user_notification(
+                r_user_id,
+                {
+                    "event_type": "HOLD_BECAME_CLAIMABLE",
+                    "hold_id": str(r_hold_id),
+                    "lot_id": str(lot_id_val),
+                    "lot_title": r_title,
+                    "amount": str(r_amount),
+                    "reason": "RESERVE_NOT_MET",
+                    "new_claimable_balance": str(r_claimable),
+                    "server_time": now.isoformat(),
+                },
+            )
+
+        return {
+            "status": "ENDED_UNSOLD",
+            "lot_id": str(lot_id_val),
+            "final_price": str(final_price_val),
+        }
