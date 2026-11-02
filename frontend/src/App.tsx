@@ -8,6 +8,7 @@ import { CatalogPage } from "./domains/catalog/CatalogPage";
 import { CreateLotPage } from "./domains/lot-create/CreateLotPage";
 import { KitchenSinkPage } from "./domains/kitchen-sink/KitchenSinkPage";
 import { AppShell } from "./domains/layout/AppShell";
+import { LiveLotPage } from "./domains/live-auction/LiveLotPage";
 import { WalletPage } from "./domains/wallet/WalletPage";
 
 const queryClient = new QueryClient({
@@ -29,6 +30,7 @@ export const AppRoutes: React.FC = () => {
         <Route path="/auth/callback" element={<OAuthCallbackPage />} />
         <Route path="/wallet" element={<WalletPage />} />
         <Route path="/lots/new" element={<CreateLotPage />} />
+        <Route path="/lots/:lotId" element={<LiveLotPage />} />
         <Route path="/kitchen-sink" element={<KitchenSinkPage />} />
         <Route path="/" element={<Navigate to="/catalog" replace />} />
         <Route path="*" element={<Navigate to="/catalog" replace />} />
