@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
+import { useUserNotificationsSocket } from "../live-auction/useLiveLotSocket";
 import { ApiClientError, apiClient } from "../../shared/api/client";
 import { useAuthStore } from "../../shared/store/authStore";
 import { useClockStore } from "../../shared/store/clockStore";
@@ -17,6 +18,7 @@ export interface AppShellProps {
 }
 
 export const AppShell: React.FC<AppShellProps> = ({ children }) => {
+  useUserNotificationsSocket();
   const location = useLocation();
   const navigate = useNavigate();
   const user = useAuthStore((state) => state.user);

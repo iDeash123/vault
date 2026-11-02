@@ -34,7 +34,10 @@ export function handleIncomingWsFrame<TEvent>(
 
 export function buildWsUrl(path: string, token?: string | null): string {
   const baseWs = env.VITE_WS_BASE_URL.replace(/\/+$/, "");
-  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  let normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  if (baseWs.endsWith("/ws") && normalizedPath.startsWith("/ws/")) {
+    normalizedPath = normalizedPath.slice(3);
+  }
   const url = new URL(`${baseWs}${normalizedPath}`);
   if (token !== undefined && token !== null && token.length > 0) {
     url.searchParams.set("token", token);
@@ -96,10 +99,18 @@ export function connectWebSocket<TEvent>(
 export function connectLotStream(
   lotId: string,
   onEvent: (event: LotWsEvent) => void,
+  callbacks?: {
+    onOpen?: (() => void) | undefined;
+    onClose?: (() => void) | undefined;
+    onError?: ((error: Event) => void) | undefined;
+  },
 ): WsManagedSocket {
   return connectWebSocket<LotWsEvent>({
     path: `/lots/${lotId}`,
     onEvent,
+    onOpen: callbacks?.onOpen,
+    onClose: callbacks?.onClose,
+    onError: callbacks?.onError,
   });
 }
 
@@ -107,11 +118,19 @@ export function connectUserNotificationsStream(
   token: string,
   onEvent: (event: UserNotificationWsEvent) => void,
   sendFirstFrameAuth = false,
+  callbacks?: {
+    onOpen?: (() => void) | undefined;
+    onClose?: (() => void) | undefined;
+    onError?: ((error: Event) => void) | undefined;
+  },
 ): WsManagedSocket {
   return connectWebSocket<UserNotificationWsEvent>({
     path: "/user/notifications",
     token,
     sendFirstFrameAuth,
     onEvent,
+    onOpen: callbacks?.onOpen,
+    onClose: callbacks?.onClose,
+    onError: callbacks?.onError,
   });
 }
