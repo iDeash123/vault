@@ -6,6 +6,7 @@ import { OAuthCallbackPage } from "./domains/auth/OAuthCallbackPage";
 import { RegisterPage } from "./domains/auth/RegisterPage";
 import { CatalogPage } from "./domains/catalog/CatalogPage";
 import { CreateLotPage } from "./domains/lot-create/CreateLotPage";
+import { OrdersPage } from "./domains/escrow/OrdersPage";
 import { KitchenSinkPage } from "./domains/kitchen-sink/KitchenSinkPage";
 import { AppShell } from "./domains/layout/AppShell";
 import { LiveLotPage } from "./domains/live-auction/LiveLotPage";
@@ -31,6 +32,7 @@ export const AppRoutes: React.FC = () => {
         <Route path="/wallet" element={<WalletPage />} />
         <Route path="/lots/new" element={<CreateLotPage />} />
         <Route path="/lots/:lotId" element={<LiveLotPage />} />
+        <Route path="/orders" element={<OrdersPage />} />
         <Route path="/kitchen-sink" element={<KitchenSinkPage />} />
         <Route path="/" element={<Navigate to="/catalog" replace />} />
         <Route path="*" element={<Navigate to="/catalog" replace />} />
